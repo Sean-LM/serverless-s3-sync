@@ -27,11 +27,15 @@ plugins:
 ```yaml
 custom:
   s3Sync:
+    # A simple configuration for copying static assets
     - bucketName: my-static-site-assets # required
       bucketPrefix: assets/ # optional
       localDir: dist/assets # required
+
+    # An example of possible configuration options
     - bucketName: my-other-site
       localDir: path/to/other-site
+      deleteRemoved: true # optional, indicates whether sync deletes files no longer present in localDir. Defaults to 'true'
       acl: public-read # optional
       followSymlinks: true # optional
       defaultContentType: text/html # optional
@@ -40,8 +44,18 @@ custom:
             CacheControl: 'no-cache'
         - "*.js":
             CacheControl: 'public, max-age=31536000'
+      bucketTags: # optional, these are appended to existing S3 bucket tags (overwriting tags with the same key)
+        tagKey1: tagValue1
+        tagKey2: tagValue2
+
+    # This references bucket name from the output of the current stack
     - bucketNameKey: AnotherBucketNameOutputKey
       localDir: path/to/another
+
+    # ... but can also reference it from the output of another stack,
+    # see https://www.serverless.com/framework/docs/providers/aws/guide/variables#reference-cloudformation-outputs
+    - bucketName: ${cf:another-cf-stack-name.ExternalBucketOutputKey}
+      localDir: path
 
 resources:
   Resources:

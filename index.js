@@ -9,6 +9,7 @@ const fs = require('fs');
 const resolveStackOutput = require('./resolveStackOutput')
 const messagePrefix = 'S3 Sync: ';
 const mime = require('mime');
+const child_process = require('child_process');
 
 const toS3Path = (osPath) => osPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/');
 
@@ -23,7 +24,8 @@ class ServerlessS3Sync {
         usage: 'Sync directories and S3 prefixes',
         lifecycleEvents: [
           'sync',
-          'metadata'
+          'metadata',
+          'tags'
         ],
         commands: {
           bucket: {
@@ -36,7 +38,8 @@ class ServerlessS3Sync {
             },
             lifecycleEvents: [
               'sync',
-              'metadata'
+              'metadata',
+              'tags'
             ]
           }
         }
@@ -44,12 +47,14 @@ class ServerlessS3Sync {
     };
 
     this.hooks = {
-      'after:deploy:deploy': () => options.nos3sync ? undefined : BbPromise.bind(this).then(this.sync).then(this.syncMetadata),
+      'after:deploy:deploy': () => options.nos3sync ? undefined : BbPromise.bind(this).then(this.sync).then(this.syncMetadata).then(this.syncBucketTags),
       'before:remove:remove': () => BbPromise.bind(this).then(this.clear),
       's3sync:sync': () => BbPromise.bind(this).then(this.sync),
       's3sync:metadata': () => BbPromise.bind(this).then(this.syncMetadata),
+      's3sync:tags': () => BbPromise.bind(this).then(this.syncBucketTags),
       's3sync:bucket:sync': () => BbPromise.bind(this).then(this.sync),
-      's3sync:bucket:metadata': () => BbPromise.bind(this).then(this.syncMetadata)
+      's3sync:bucket:metadata': () => BbPromise.bind(this).then(this.syncMetadata),
+      's3sync:bucket:tags': () => BbPromise.bind(this).then(this.syncBucketTags),
     };
   }
 
@@ -59,7 +64,10 @@ class ServerlessS3Sync {
 	if (provider.cachedCredentials && typeof(provider.cachedCredentials.accessKeyId) != 'undefined'
 		&& typeof(provider.cachedCredentials.secretAccessKey) != 'undefined'
 		&& typeof(provider.cachedCredentials.sessionToken) != 'undefined') {
-		region = provider.cachedCredentials.region
+    // Temporarily disabled the below below because Serverless framework is not interpolating ${env:foo}
+    // in provider.credentials.region or provider.cachedCredentials.region
+    // region = provider.cachedCredentials.region
+    region = provider.getRegion();
 		awsCredentials = {
 			accessKeyId: provider.cachedCredentials.accessKeyId,
 			secretAccessKey: provider.cachedCredentials.secretAccessKey,
@@ -115,6 +123,10 @@ class ServerlessS3Sync {
       if (s.hasOwnProperty('deleteRemoved')) {
           deleteRemoved = s.deleteRemoved;
       }
+      let preCommand = undefined
+      if (s.hasOwnProperty('preCommand')) {
+          preCommand = s.preCommand;
+      }
 
       return this.getBucketName(s)
         .then(bucketName => {
@@ -126,6 +138,11 @@ class ServerlessS3Sync {
           return new Promise((resolve) => {
             const localDir = [servicePath, s.localDir].join('/');
 
+            if (typeof(preCommand) != 'undefined') {
+              cli.consoleLog(`${messagePrefix}${chalk.yellow('Running pre-command...')}`);
+              child_process.execSync(preCommand, { stdio: 'inherit' });
+            }
+
             const params = {
               maxAsyncS3: 5,
               localDir,
@@ -133,17 +150,25 @@ class ServerlessS3Sync {
               followSymlinks: followSymlinks,
               getS3Params: (localFile, stat, cb) => {
                 const s3Params = {};
+                let onlyForEnv;
 
                 if(Array.isArray(s.params)) {
                   s.params.forEach((param) => {
                     const glob = Object.keys(param)[0];
                     if(minimatch(localFile, `${path.resolve(localDir)}/${glob}`)) {
                       Object.assign(s3Params, this.extractMetaParams(param) || {});
+                      onlyForEnv = s3Params['OnlyForEnv'] || onlyForEnv;
                     }
                   });
+                  // to avoid parameter validation error
+                  delete s3Params['OnlyForEnv'];
                 }
 
-                cb(null, s3Params);
+                if (onlyForEnv && onlyForEnv !== this.options.env) {
+                  cb(null, null);
+                } else {
+                  cb(null, s3Params);
+                }
               },
               s3Params: {
                 Bucket: bucketName,
@@ -254,12 +279,22 @@ class ServerlessS3Sync {
       }
       const localDir = path.join(servicePath, s.localDir);
       let filesToSync = [];
+      let ignoreFiles = [];
       if(Array.isArray(s.params)) {
         s.params.forEach((param) => {
           const glob = Object.keys(param)[0];
           let files = this.getLocalFiles(localDir, []);
           minimatch.match(files, `${path.resolve(localDir)}${path.sep}${glob}`, {matchBase: true}).forEach((match) => {
-            filesToSync.push({name: match, params: this.extractMetaParams(param)});
+            const params = this.extractMetaParams(param);
+            if (ignoreFiles.includes(match)) return;
+            if (params['OnlyForEnv'] && params['OnlyForEnv'] !== this.options.env) {
+              ignoreFiles.push(match);
+              filesToSync = filesToSync.filter(e => e.name !== match);
+              return;
+            }
+            // to avoid Unexpected Parameter error
+            delete params['OnlyForEnv'];
+            filesToSync.push({name: match, params});
           });
         });
       }
@@ -308,9 +343,94 @@ class ServerlessS3Sync {
       });
   }
 
+  syncBucketTags() {
+    const s3Sync = this.serverless.service.custom.s3Sync;
+    const cli = this.serverless.cli;
+    if (!Array.isArray(s3Sync)) {
+      cli.consoleLog(`${messagePrefix}${chalk.red('No configuration found')}`)
+      return Promise.resolve();
+    }
+    cli.consoleLog(`${messagePrefix}${chalk.yellow('Updating bucket tags...')}`);
+
+    const promises = s3Sync.map( async (s) => {
+      if (!s.bucketName && !s.bucketNameKey) {
+        throw 'Invalid custom.s3Sync';
+      }
+
+      if (!s.bucketTags) {
+        // bucket tags not configured for this bucket, skip it
+        // so we don't require additional s3:getBucketTagging permissions
+        return null;
+      }
+
+      // convert the tag key/value pairs into a TagSet structure for the putBucketTagging command
+      const tagsToUpdate = Object.keys(s.bucketTags).map(tagKey => ({
+        Key: tagKey,
+        Value: s.bucketTags[tagKey]
+      }));
+
+      return this.getBucketName(s)
+        .then(bucketName => {
+          if (this.options && this.options.bucket && bucketName != this.options.bucket) {
+            // if the bucket option is given, that means we're in the subcommand where we're
+            // only syncing one bucket, so only continue if this bucket name matches
+            return null;
+          }
+
+          // AWS.S3 does not have an option to append tags to a bucket, it can only rewrite the whole set of tags
+          // To avoid removing system tags set by other tools, we read the existing tags, merge our tags in the list
+          // and then write them all back
+          return this.client().s3.getBucketTagging({ Bucket: bucketName }).promise()
+            .then(data => data.TagSet)
+            .then(existingTagSet => {
+
+              this.mergeTags(existingTagSet, tagsToUpdate);
+              const putParams = {
+                Bucket: bucketName,
+                Tagging: {
+                  TagSet: existingTagSet
+                }
+              };
+              return this.client().s3.putBucketTagging(putParams).promise();
+            })
+
+        });
+    });
+    return Promise.all((promises))
+      .then(() => {
+        cli.printDot();
+        cli.consoleLog('');
+        cli.consoleLog(`${messagePrefix}${chalk.yellow('Updated bucket tags.')}`);
+      });
+  }
+
+  mergeTags(existingTagSet, tagsToMerge) {
+    tagsToMerge.forEach(tag => {
+      const existingTag = existingTagSet.find(et => et.Key === tag.Key);
+      if (existingTag) {
+        existingTag.Value = tag.Value;
+      } else {
+        existingTagSet.push(tag);
+      }
+    });
+  }
+
   getLocalFiles(dir, files) {
+    const cli = this.serverless.cli;
+    try {
+      fs.accessSync(dir, fs.constants.R_OK);
+    } catch (e) {
+      cli.consoleLog(`${messagePrefix}${chalk.red(`The directory ${dir} does not exist.`)}`);
+      return files;
+    }
     fs.readdirSync(dir).forEach(file => {
       let fullPath = path.join(dir, file);
+      try {
+        fs.accessSync(fullPath, fs.constants.R_OK);
+      } catch (e) {
+        cli.consoleLog(`${messagePrefix}${chalk.red(`The file ${fullPath} doesn not exist.`)}`);
+        return;
+      }
       if (fs.lstatSync(fullPath).isDirectory()) {
         this.getLocalFiles(fullPath, files);
       } else {
